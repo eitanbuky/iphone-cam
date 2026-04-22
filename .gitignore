@@ -1,0 +1,16 @@
+# Swift build artifacts
+ios/.build/
+ios/*.xcodeproj/
+ios/*.xcworkspace/
+ios/xtool/
+
+# Windows receiver
+windows/__pycache__/
+*.pyc
+
+# Certs (generated locally, don't commit)
+certs/
+
+# Temp
+.tmp/
+*.log

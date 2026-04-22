@@ -1,0 +1,7 @@
+version: 1
+bundleID: com.local.iphonecam
+infoPlist:
+  NSCameraUsageDescription: "Streams your iPhone camera to your PC as a high-quality webcam."
+  NSLocalNetworkUsageDescription: "Accepts connections from your PC to receive the camera stream."
+  UIBackgroundModes:
+    - voip
