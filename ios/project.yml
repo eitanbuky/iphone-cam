@@ -1,0 +1,27 @@
+name: iPhoneCam
+options:
+  bundleIdPrefix: com.local
+  deploymentTarget:
+    iOS: "17.0"
+
+targets:
+  iPhoneCam:
+    type: application
+    platform: iOS
+    bundleId: com.local.iphonecam
+    sources:
+      - path: Sources/iPhoneCam
+        excludes:
+          - Info.plist
+    info:
+      path: Sources/iPhoneCam/Info.plist
+      properties: {}
+    settings:
+      base:
+        SWIFT_VERSION: "6.0"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGNING_IDENTITY: ""
+        IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+        ONLY_ACTIVE_ARCH: NO
+        ENABLE_BITCODE: NO

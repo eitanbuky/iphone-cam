@@ -7,79 +7,58 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest   # Xcode 16, stable iOS SDK, native Apple toolchain
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install xtool
-        run: |
-          curl -fsSL -L \
-            https://github.com/xtool-org/xtool/releases/download/1.16.1/xtool.app.zip \
-            -o /tmp/xtool.zip
-          unzip -q /tmp/xtool.zip -d /tmp/xtool-app
-          # Use the binary from inside the app bundle
-          XTOOL_BIN=$(find /tmp/xtool-app -name "xtool" -type f | grep -v debug | head -1)
-          sudo ln -sf "$XTOOL_BIN" /usr/local/bin/xtool
-          xtool --version
-
       - name: Select Xcode
         run: |
-          # Use latest stable Xcode
           sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
           xcodebuild -version
 
-      - name: Install iOS SDK via xtool
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        working-directory: ios
+        run: xcodegen generate
+
+      - name: Build app (unsigned)
         working-directory: ios
         run: |
-          # xtool uses the system Xcode SDK on macOS — just confirm it's there
-          xtool sdk list 2>/dev/null || true
-          xcrun --sdk iphoneos --show-sdk-version
+          xcodebuild \
+            -project iPhoneCam.xcodeproj \
+            -scheme iPhoneCam \
+            -sdk iphoneos \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_IDENTITY="" \
+            ONLY_ACTIVE_ARCH=NO \
+            ENABLE_BITCODE=NO \
+            -derivedDataPath /tmp/DerivedData \
+            build
 
-      - name: Build IPA
-        working-directory: ios
+      - name: Package IPA
         run: |
-          # Build without device auth (unsigned — Sideloadly will sign it)
-          xtool dev build --configuration release --ipa 2>&1 || {
-            echo "xtool build failed, trying xcodebuild fallback..."
-
-            # Fallback: generate xcodeproj and use xcodebuild
-            xtool dev generate-xcode-project 2>/dev/null || swift package generate-xcodeproj 2>/dev/null || true
-
-            # Build with xcodebuild (unsigned)
-            xcodebuild \
-              -scheme iPhoneCam \
-              -sdk iphoneos \
-              -configuration Release \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGNING_REQUIRED=NO \
-              -derivedDataPath /tmp/DerivedData \
-              build
-
-            # Package .app into .ipa
-            APP=$(find /tmp/DerivedData -name "*.app" -not -path "*/iphoneos-simulator*" | head -1)
-            echo "Found app: $APP"
-            mkdir -p /tmp/Payload
-            cp -r "$APP" /tmp/Payload/
-            cd /tmp && zip -r "$GITHUB_WORKSPACE/ios/iPhoneCam.ipa" Payload/
-            rm -rf /tmp/Payload
-          }
-
-      - name: Find and verify IPA
-        run: |
-          find . -name "*.ipa" 2>/dev/null
-          IPA=$(find . -name "*.ipa" | head -1)
-          if [ -n "$IPA" ]; then
-            echo "IPA found: $IPA ($(du -h "$IPA" | cut -f1))"
-          else
-            echo "WARNING: No IPA found — check build logs above"
+          APP=$(find /tmp/DerivedData -name "*.app" -path "*Release-iphoneos*" | head -1)
+          echo "Found app: $APP"
+          if [ -z "$APP" ]; then
+            echo "ERROR: No .app found. Checking DerivedData structure:"
+            find /tmp/DerivedData -name "*.app" 2>/dev/null | head -20
+            exit 1
           fi
+          mkdir -p /tmp/Payload
+          cp -r "$APP" /tmp/Payload/
+          cd /tmp && zip -r "$GITHUB_WORKSPACE/ios/iPhoneCam.ipa" Payload/
+          echo "IPA size: $(du -h "$GITHUB_WORKSPACE/ios/iPhoneCam.ipa" | cut -f1)"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
         with:
           name: iPhoneCam-build-${{ github.run_number }}
-          path: "**/*.ipa"
-          if-no-files-found: warn
+          path: ios/iPhoneCam.ipa
+          if-no-files-found: error
           retention-days: 30
