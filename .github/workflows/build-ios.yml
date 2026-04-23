@@ -13,13 +13,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Xcode
-        uses: maxim-lobanov/setup-xcode@v1
-        with:
-          xcode-version: latest-stable
-
-      - name: Confirm Xcode version
-        run: xcodebuild -version
+      - name: Select Xcode 16
+        run: |
+          XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort | tail -1)
+          echo "Using Xcode: $XCODE"
+          sudo xcode-select -s "$XCODE/Contents/Developer"
+          xcodebuild -version
 
       - name: Install xcodegen
         run: brew install xcodegen
@@ -38,7 +37,6 @@ jobs:
             -configuration Release \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
-            "CODE_SIGNING_IDENTITY=" \
             ONLY_ACTIVE_ARCH=NO \
             ENABLE_BITCODE=NO \
             -derivedDataPath /tmp/DerivedData \
@@ -46,8 +44,6 @@ jobs:
 
       - name: Package IPA
         run: |
-          echo "Searching for .app bundle..."
-          find /tmp/DerivedData -name "*.app" 2>/dev/null
           APP=$(find /tmp/DerivedData -name "*.app" -path "*Release-iphoneos*" | head -1)
           if [ -z "$APP" ]; then
             APP=$(find /tmp/DerivedData -name "*.app" | grep -v simulator | head -1)
@@ -55,6 +51,7 @@ jobs:
           echo "Found app: $APP"
           if [ -z "$APP" ]; then
             echo "ERROR: No .app found"
+            find /tmp/DerivedData -name "*.app" 2>/dev/null
             exit 1
           fi
           mkdir -p /tmp/Payload
