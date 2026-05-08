@@ -15,6 +15,10 @@
     <key>NSCameraUsageDescription</key>
     <string>Streams your camera to your PC as a high-quality webcam.</string>
 
+    <!-- Microphone permission (required for audio capture) -->
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Streams audio from your iPhone to your PC alongside the video.</string>
+
     <!-- Local network permission (for TCP server) -->
     <key>NSLocalNetworkUsageDescription</key>
     <string>Accepts connections from your PC to stream the camera feed.</string>

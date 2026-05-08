@@ -10,6 +10,11 @@ class CameraStreamer: NSObject, ObservableObject {
 
     @Published var status: String = "Tap Start to begin"
     @Published var localIP: String = ""
+
+    override init() {
+        super.init()
+        localIP = getLocalIP()
+    }
     @Published var resolution: String = "—"
     @Published var fps: Int = 0
     @Published var isCapturing: Bool = false
@@ -21,6 +26,8 @@ class CameraStreamer: NSObject, ObservableObject {
     private var compressionSession: VTCompressionSession?
     private var listener: NWListener?
     private var activeConnection: NWConnection?
+    private var audioListener: NWListener?
+    private var activeAudioConnection: NWConnection?
     private let streamQueue = DispatchQueue(label: "cam.stream", qos: .userInteractive)
 
     private var frameCount = 0
@@ -34,6 +41,7 @@ class CameraStreamer: NSObject, ObservableObject {
         requestCameraPermission { [weak self] in
             self?.setupCapture()
             self?.startTCPServer()
+            self?.startAudioTCPServer()
         }
     }
 
@@ -44,6 +52,8 @@ class CameraStreamer: NSObject, ObservableObject {
         compressionSession = nil
         activeConnection?.cancel()
         listener?.cancel()
+        activeAudioConnection?.cancel()
+        audioListener?.cancel()
         captureSession = nil
         parameterSetsData = nil
         DispatchQueue.main.async {
@@ -90,6 +100,14 @@ class CameraStreamer: NSObject, ObservableObject {
 
         session.addInput(input)
 
+        // Add Audio Input
+        if let audioDevice = AVCaptureDevice.default(for: .audio),
+           let audioInput = try? AVCaptureDeviceInput(device: audioDevice) {
+            if session.canAddInput(audioInput) {
+                session.addInput(audioInput)
+            }
+        }
+
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
@@ -97,6 +115,13 @@ class CameraStreamer: NSObject, ObservableObject {
         output.setSampleBufferDelegate(self, queue: streamQueue)
         output.alwaysDiscardsLateVideoFrames = true
         session.addOutput(output)
+
+        // Add Audio Output
+        let audioOutput = AVCaptureAudioDataOutput()
+        audioOutput.setSampleBufferDelegate(self, queue: streamQueue)
+        if session.canAddOutput(audioOutput) {
+            session.addOutput(audioOutput)
+        }
 
         // Lock landscape orientation
         if let conn = output.connection(with: .video) {
@@ -205,6 +230,20 @@ class CameraStreamer: NSObject, ObservableObject {
         listener.start(queue: streamQueue)
     }
 
+    private func startAudioTCPServer() {
+        guard let listener = try? NWListener(using: .tcp, on: 4748) else { return }
+        self.audioListener = listener
+
+        listener.newConnectionHandler = { [weak self] connection in
+            guard let self = self else { return }
+            self.activeAudioConnection?.cancel()
+            self.activeAudioConnection = connection
+            connection.start(queue: self.streamQueue)
+        }
+
+        listener.start(queue: streamQueue)
+    }
+
     // MARK: - Frame sending
 
     private func sendData(_ data: Data) {
@@ -278,6 +317,18 @@ class CameraStreamer: NSObject, ObservableObject {
         frameCount += 1
     }
 
+    private func handleAudioFrame(_ sampleBuffer: CMSampleBuffer) {
+        guard activeAudioConnection != nil else { return }
+        
+        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
+        let length = CMBlockBufferGetDataLength(blockBuffer)
+        var pcmData = [UInt8](repeating: 0, count: length)
+        CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: &pcmData)
+        
+        let data = Data(pcmData)
+        activeAudioConnection?.send(content: data, completion: .idempotent)
+    }
+
     // MARK: - Helpers
 
     private func getLocalIP() -> String {
@@ -303,24 +354,28 @@ class CameraStreamer: NSObject, ObservableObject {
     }
 }
 
-// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+// MARK: - AVCaptureVideo/AudioDataOutputSampleBufferDelegate
 
-extension CameraStreamer: AVCaptureVideoDataOutputSampleBufferDelegate {
+extension CameraStreamer: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        guard let cs = compressionSession,
-              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        if output is AVCaptureVideoDataOutput {
+            guard let cs = compressionSession,
+                  let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        VTCompressionSessionEncodeFrame(
-            cs,
-            imageBuffer: imageBuffer,
-            presentationTimeStamp: pts,
-            duration: .invalid,
-            frameProperties: nil,
-            infoFlagsOut: nil
-        ) { [weak self] status, _, encoded in
-            guard status == noErr, let encoded = encoded else { return }
-            self?.handleEncodedFrame(encoded)
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            VTCompressionSessionEncodeFrame(
+                cs,
+                imageBuffer: imageBuffer,
+                presentationTimeStamp: pts,
+                duration: .invalid,
+                frameProperties: nil,
+                infoFlagsOut: nil
+            ) { [weak self] status, _, encoded in
+                guard status == noErr, let encoded = encoded else { return }
+                self?.handleEncodedFrame(encoded)
+            }
+        } else if output is AVCaptureAudioDataOutput {
+            handleAudioFrame(sampleBuffer)
         }
     }
 }
