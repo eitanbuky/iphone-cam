@@ -1,6 +1,5 @@
 import AVFoundation
 import VideoToolbox
-import Network
 import Darwin
 
 class CameraStreamer: NSObject, ObservableObject {
@@ -14,38 +13,43 @@ class CameraStreamer: NSObject, ObservableObject {
 
     var captureSession: AVCaptureSession?
     private var compressionSession: VTCompressionSession?
-    private var listener: NWListener?
-    private var activeConnection: NWConnection?
+
+    // BSD sockets — no entitlement required (NWListener crashes on free-cert sideloads)
+    private var serverFD: Int32 = -1
+    private var clientFD: Int32 = -1
+    private var serverRunning = false
+
     private let streamQueue = DispatchQueue(label: "cam.stream", qos: .userInteractive)
-    private let setupQueue = DispatchQueue(label: "cam.setup", qos: .userInitiated)
+    private let setupQueue  = DispatchQueue(label: "cam.setup",  qos: .userInitiated)
 
     private var frameCount = 0
     private var fpsTimer: Timer?
-    private var parameterSetsData: Data?
 
     override init() {
         super.init()
         localIP = getLocalIP()
     }
 
+    // MARK: - Public
+
     func start() {
         requestCameraPermission { [weak self] in
-            // Always run setup on background queue — never block main thread
             self?.setupQueue.async { self?.setupCapture() }
         }
     }
 
     func stop() {
-        DispatchQueue.main.async { self.fpsTimer?.invalidate() }
+        serverRunning = false
+        closeClient()
+        if serverFD >= 0 { Darwin.close(serverFD); serverFD = -1 }
+
         setupQueue.async { [weak self] in
             self?.captureSession?.stopRunning()
             if let cs = self?.compressionSession { VTCompressionSessionInvalidate(cs) }
             self?.compressionSession = nil
-            self?.activeConnection?.cancel()
-            self?.listener?.cancel()
             self?.captureSession = nil
-            self?.parameterSetsData = nil
             DispatchQueue.main.async {
+                self?.fpsTimer?.invalidate()
                 self?.isCapturing = false
                 self?.isStreaming = false
                 self?.status = "Tap Start to begin"
@@ -54,22 +58,23 @@ class CameraStreamer: NSObject, ObservableObject {
         }
     }
 
+    // MARK: - Permissions
+
     private func requestCameraPermission(completion: @escaping () -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             completion()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
-                if granted {
-                    completion()
-                } else {
-                    DispatchQueue.main.async { self?.status = "Camera permission denied" }
-                }
+                if granted { completion() }
+                else { DispatchQueue.main.async { self?.status = "Camera permission denied" } }
             }
         default:
             DispatchQueue.main.async { self.status = "Camera permission denied — check Settings" }
         }
     }
+
+    // MARK: - Capture setup (runs on setupQueue)
 
     private func setupCapture() {
         let session = AVCaptureSession()
@@ -88,9 +93,7 @@ class CameraStreamer: NSObject, ObservableObject {
         session.addInput(input)
 
         let output = AVCaptureVideoDataOutput()
-        output.videoSettings = [
-            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-        ]
+        output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange]
         output.setSampleBufferDelegate(self, queue: streamQueue)
         output.alwaysDiscardsLateVideoFrames = true
         session.addOutput(output)
@@ -117,84 +120,131 @@ class CameraStreamer: NSObject, ObservableObject {
         session.startRunning()
         startTCPServer()
 
-        // Timer must be scheduled on main RunLoop
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            self.fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-                guard let self = self else { return }
-                self.fps = self.frameCount
-                self.frameCount = 0
-            }
             self.isCapturing = true
             self.resolution = resolutionLabel
             self.status = "Waiting for PC..."
+            self.fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
+                self.streamQueue.async {
+                    let count = self.frameCount
+                    self.frameCount = 0
+                    DispatchQueue.main.async { self.fps = count }
+                }
+            }
         }
     }
+
+    // MARK: - VideoToolbox
 
     private func setupVideoToolbox(width: Int, height: Int) -> Bool {
         var session: VTCompressionSession?
         let err = VTCompressionSessionCreate(
             allocator: nil,
-            width: Int32(width),
-            height: Int32(height),
+            width: Int32(width), height: Int32(height),
             codecType: kCMVideoCodecType_H264,
-            encoderSpecification: nil,
-            imageBufferAttributes: nil,
-            compressedDataAllocator: nil,
-            outputCallback: nil,
-            refcon: nil,
+            encoderSpecification: nil, imageBufferAttributes: nil,
+            compressedDataAllocator: nil, outputCallback: nil, refcon: nil,
             compressionSessionOut: &session
         )
         guard err == noErr, let session = session else {
-            DispatchQueue.main.async { self.status = "VideoToolbox setup failed (\(err))" }
+            DispatchQueue.main.async { self.status = "Encoder setup failed (\(err))" }
             return false
         }
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime,             value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-        let bitrate: Int = width >= 3840 ? 50_000_000 : 15_000_000
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: 60))
+        let bitrate = width >= 3840 ? 50_000_000 : 15_000_000
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate,       value: NSNumber(value: bitrate))
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval,  value: NSNumber(value: 60))
         VTCompressionSessionPrepareToEncodeFrames(session)
         compressionSession = session
         return true
     }
 
+    // MARK: - BSD socket TCP server
+
     private func startTCPServer() {
-        guard let listener = try? NWListener(using: .tcp, on: 4747) else { return }
-        self.listener = listener
+        let fd = socket(AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else {
+            DispatchQueue.main.async { self.status = "Socket error" }
+            return
+        }
 
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self = self else { return }
-            self.activeConnection?.cancel()
-            self.activeConnection = connection
-            self.parameterSetsData = nil
+        var reuseVal: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,  &reuseVal, socklen_t(MemoryLayout<Int32>.size))
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE,  &reuseVal, socklen_t(MemoryLayout<Int32>.size))
 
-            connection.stateUpdateHandler = { [weak self] state in
-                switch state {
-                case .ready:
-                    DispatchQueue.main.async { self?.isStreaming = true; self?.status = "Streaming to PC" }
-                case .failed, .cancelled:
-                    DispatchQueue.main.async { self?.isStreaming = false; self?.status = "Waiting for PC..." }
-                default: break
+        var addr = sockaddr_in()
+        addr.sin_len    = UInt8(MemoryLayout<sockaddr_in>.size)
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port   = CFSwapInt16HostToBig(4747)
+        addr.sin_addr   = in_addr(s_addr: INADDR_ANY)
+
+        let bound = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0 else {
+            Darwin.close(fd)
+            DispatchQueue.main.async { self.status = "Port 4747 bind failed" }
+            return
+        }
+
+        Darwin.listen(fd, 1)
+        serverFD = fd
+        serverRunning = true
+
+        streamQueue.async { self.acceptLoop() }
+    }
+
+    private func acceptLoop() {
+        while serverRunning && serverFD >= 0 {
+            var clientAddr = sockaddr_in()
+            var addrLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let fd = withUnsafeMutablePointer(to: &clientAddr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    accept(serverFD, $0, &addrLen)
                 }
             }
-            connection.start(queue: self.streamQueue)
+            guard fd >= 0 else { break }
+
+            closeClient()
+            clientFD = fd
+            DispatchQueue.main.async { self.isStreaming = true; self.status = "Streaming to PC" }
         }
-        listener.start(queue: streamQueue)
+    }
+
+    private func closeClient() {
+        if clientFD >= 0 {
+            Darwin.close(clientFD)
+            clientFD = -1
+            DispatchQueue.main.async { self.isStreaming = false; self.status = "Waiting for PC..." }
+        }
     }
 
     private func sendData(_ data: Data) {
-        guard let connection = activeConnection else { return }
-        connection.send(content: data, completion: .idempotent)
+        guard clientFD >= 0 else { return }
+        data.withUnsafeBytes { buf in
+            guard let base = buf.baseAddress else { return }
+            var sent = 0
+            while sent < data.count {
+                let n = Darwin.send(clientFD, base.advanced(by: sent), data.count - sent, 0)
+                if n <= 0 { closeClient(); return }
+                sent += n
+            }
+        }
     }
+
+    // MARK: - H.264 framing
 
     private func parameterSets(from formatDesc: CMFormatDescription) -> Data {
         var count = 0
         CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
             formatDesc, parameterSetIndex: 0,
             parameterSetPointerOut: nil, parameterSetSizeOut: nil,
-            parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil
-        )
+            parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil)
         var data = Data()
         for i in 0..<count {
             var ptr: UnsafePointer<UInt8>?
@@ -202,8 +252,7 @@ class CameraStreamer: NSObject, ObservableObject {
             CMVideoFormatDescriptionGetH264ParameterSetAtIndex(
                 formatDesc, parameterSetIndex: i,
                 parameterSetPointerOut: &ptr, parameterSetSizeOut: &size,
-                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil
-            )
+                parameterSetCountOut: nil, nalUnitHeaderLengthOut: nil)
             if let ptr = ptr {
                 data += Data([0x00, 0x00, 0x00, 0x01])
                 data += Data(UnsafeBufferPointer(start: ptr, count: size))
@@ -213,11 +262,11 @@ class CameraStreamer: NSObject, ObservableObject {
     }
 
     private func handleEncodedFrame(_ sampleBuffer: CMSampleBuffer) {
-        guard activeConnection != nil else { return }
+        guard clientFD >= 0 else { return }
 
         let isKeyFrame: Bool = {
-            if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
-               let first = attachments.first {
+            if let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
+               let first = arr.first {
                 return !(first[kCMSampleAttachmentKey_NotSync] as? Bool ?? false)
             }
             return true
@@ -239,13 +288,15 @@ class CameraStreamer: NSObject, ObservableObject {
             offset += 4
             guard offset + naluLen <= totalLen else { break }
             annexB += Data([0x00, 0x00, 0x00, 0x01])
-            annexB += raw[offset..<offset + naluLen]
+            annexB += raw[offset ..< offset + naluLen]
             offset += naluLen
         }
 
         sendData(annexB)
         frameCount += 1
     }
+
+    // MARK: - Helpers
 
     private func getLocalIP() -> String {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
@@ -269,18 +320,16 @@ class CameraStreamer: NSObject, ObservableObject {
     }
 }
 
+// MARK: - AVCaptureVideoDataOutputSampleBufferDelegate
+
 extension CameraStreamer: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
         guard let cs = compressionSession,
               let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        VTCompressionSessionEncodeFrame(
-            cs,
-            imageBuffer: imageBuffer,
-            presentationTimeStamp: pts,
-            duration: .invalid,
-            frameProperties: nil,
-            infoFlagsOut: nil
+        VTCompressionSessionEncodeFrame(cs, imageBuffer: imageBuffer,
+            presentationTimeStamp: pts, duration: .invalid,
+            frameProperties: nil, infoFlagsOut: nil
         ) { [weak self] status, _, encoded in
             guard status == noErr, let encoded = encoded else { return }
             self?.handleEncodedFrame(encoded)
