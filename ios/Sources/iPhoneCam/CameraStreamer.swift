@@ -15,10 +15,14 @@ class CameraStreamer: NSObject, ObservableObject {
     private var compressionSession: VTCompressionSession?
 
     private var serverFD: Int32 = -1
+    // clientFD is only ever read or written on streamQueue
     private var clientFD: Int32 = -1
     private var serverRunning = false
+    // Checked in handleEncodedFrame to drop VT callbacks that arrive after teardown
+    private var isRunning = false
 
-    // acceptQueue is separate from streamQueue so blocking accept() never starves camera frames
+    // acceptQueue is separate from streamQueue so blocking accept() never starves camera frames.
+    // All clientFD mutations happen on streamQueue to avoid data races with sendData.
     private let streamQueue  = DispatchQueue(label: "cam.stream",  qos: .userInteractive)
     private let setupQueue   = DispatchQueue(label: "cam.setup",   qos: .userInitiated)
     private let acceptQueue  = DispatchQueue(label: "cam.accept",  qos: .utility)
@@ -42,8 +46,13 @@ class CameraStreamer: NSObject, ObservableObject {
 
     func stop() {
         serverRunning = false
-        closeClient()
+        // Close server socket to unblock the blocking accept() call in acceptLoop
         if serverFD >= 0 { Darwin.close(serverFD); serverFD = -1 }
+        // Flip isRunning and close client on streamQueue so no frames land after teardown
+        streamQueue.async { [weak self] in
+            self?.isRunning = false
+            self?.closeClient()
+        }
         setupQueue.async { [weak self] in
             self?.captureSession?.stopRunning()
             if let cs = self?.compressionSession { VTCompressionSessionInvalidate(cs) }
@@ -144,6 +153,8 @@ class CameraStreamer: NSObject, ObservableObject {
 
         setStatus("Starting camera...")
         captureSession = session
+        // Mark running before startRunning so the first VT callback isn't dropped
+        streamQueue.sync { isRunning = true }
         session.startRunning()
 
         setStatus("Opening TCP server...")
@@ -222,7 +233,6 @@ class CameraStreamer: NSObject, ObservableObject {
         serverFD = fd
         serverRunning = true
 
-        // Accept loop runs on its own queue so it never blocks camera frames on streamQueue
         acceptQueue.async { self.acceptLoop() }
     }
 
@@ -236,16 +246,20 @@ class CameraStreamer: NSObject, ObservableObject {
                 }
             }
             guard fd >= 0, serverRunning else { break }
-            
+
             var one: Int32 = 1
             setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            
-            closeClient()
-            clientFD = fd
-            DispatchQueue.main.async { self.isStreaming = true; self.status = "Streaming to PC" }
+
+            // Mutate clientFD on streamQueue to avoid races with sendData
+            streamQueue.async { [weak self] in
+                self?.closeClient()
+                self?.clientFD = fd
+                DispatchQueue.main.async { self?.isStreaming = true; self?.status = "Streaming to PC" }
+            }
         }
     }
 
+    // Must be called on streamQueue
     private func closeClient() {
         if clientFD >= 0 {
             Darwin.close(clientFD)
@@ -292,7 +306,7 @@ class CameraStreamer: NSObject, ObservableObject {
     }
 
     private func handleEncodedFrame(_ sampleBuffer: CMSampleBuffer) {
-        guard clientFD >= 0 else { return }
+        guard isRunning, clientFD >= 0 else { return }
 
         let isKeyFrame: Bool = {
             if let arr = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
@@ -362,7 +376,8 @@ extension CameraStreamer: AVCaptureVideoDataOutputSampleBufferDelegate {
             frameProperties: nil, infoFlagsOut: nil
         ) { [weak self] status, _, encoded in
             guard status == noErr, let encoded = encoded else { return }
-            self?.handleEncodedFrame(encoded)
+            // VT callback may arrive on any thread; dispatch to streamQueue where clientFD lives
+            self?.streamQueue.async { self?.handleEncodedFrame(encoded) }
         }
     }
 }

@@ -1,6 +1,6 @@
 name: iPhoneCam
 options:
-  bundleIdPrefix: com.local
+  bundleIdPrefix: com.eitanbuky
   deploymentTarget:
     iOS: "17.0"
 

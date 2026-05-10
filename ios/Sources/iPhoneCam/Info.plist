@@ -25,6 +25,12 @@
     <key>NSLocalNetworkUsageDescription</key>
     <string>Accepts connections from your PC to stream the camera feed.</string>
 
+    <!-- Required on iOS 14+ for local network permission prompt to trigger -->
+    <key>NSBonjourServices</key>
+    <array>
+        <string>_iphonecam._tcp</string>
+    </array>
+
     <!-- Keep running in background via VoIP socket -->
     <key>UIBackgroundModes</key>
     <array>
