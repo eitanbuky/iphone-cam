@@ -2,85 +2,74 @@ import AVFoundation
 import VideoToolbox
 import Network
 import Darwin
-import Combine
 
 class CameraStreamer: NSObject, ObservableObject {
 
-    // MARK: - Published state
-
     @Published var status: String = "Tap Start to begin"
     @Published var localIP: String = ""
-
-    override init() {
-        super.init()
-        localIP = getLocalIP()
-    }
     @Published var resolution: String = "—"
     @Published var fps: Int = 0
     @Published var isCapturing: Bool = false
     @Published var isStreaming: Bool = false
 
-    // MARK: - Private
-
     var captureSession: AVCaptureSession?
     private var compressionSession: VTCompressionSession?
     private var listener: NWListener?
     private var activeConnection: NWConnection?
-    private var audioListener: NWListener?
-    private var activeAudioConnection: NWConnection?
     private let streamQueue = DispatchQueue(label: "cam.stream", qos: .userInteractive)
+    private let setupQueue = DispatchQueue(label: "cam.setup", qos: .userInitiated)
 
     private var frameCount = 0
     private var fpsTimer: Timer?
-    private var parameterSetsData: Data? // cached SPS+PPS
+    private var parameterSetsData: Data?
 
-    // MARK: - Public
+    override init() {
+        super.init()
+        localIP = getLocalIP()
+    }
 
     func start() {
-        localIP = getLocalIP()
         requestCameraPermission { [weak self] in
-            self?.setupCapture()
-            self?.startTCPServer()
-            self?.startAudioTCPServer()
+            // Always run setup on background queue — never block main thread
+            self?.setupQueue.async { self?.setupCapture() }
         }
     }
 
     func stop() {
-        fpsTimer?.invalidate()
-        captureSession?.stopRunning()
-        if let cs = compressionSession { VTCompressionSessionInvalidate(cs) }
-        compressionSession = nil
-        activeConnection?.cancel()
-        listener?.cancel()
-        activeAudioConnection?.cancel()
-        audioListener?.cancel()
-        captureSession = nil
-        parameterSetsData = nil
-        DispatchQueue.main.async {
-            self.isCapturing = false
-            self.isStreaming = false
-            self.status = "Tap Start to begin"
-            self.fps = 0
+        DispatchQueue.main.async { self.fpsTimer?.invalidate() }
+        setupQueue.async { [weak self] in
+            self?.captureSession?.stopRunning()
+            if let cs = self?.compressionSession { VTCompressionSessionInvalidate(cs) }
+            self?.compressionSession = nil
+            self?.activeConnection?.cancel()
+            self?.listener?.cancel()
+            self?.captureSession = nil
+            self?.parameterSetsData = nil
+            DispatchQueue.main.async {
+                self?.isCapturing = false
+                self?.isStreaming = false
+                self?.status = "Tap Start to begin"
+                self?.fps = 0
+            }
         }
     }
-
-    // MARK: - Permissions
 
     private func requestCameraPermission(completion: @escaping () -> Void) {
         switch AVCaptureDevice.authorizationStatus(for: .video) {
         case .authorized:
             completion()
         case .notDetermined:
-            AVCaptureDevice.requestAccess(for: .video) { granted in
-                if granted { completion() }
-                else { DispatchQueue.main.async { self.status = "Camera permission denied" } }
+            AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
+                if granted {
+                    completion()
+                } else {
+                    DispatchQueue.main.async { self?.status = "Camera permission denied" }
+                }
             }
         default:
             DispatchQueue.main.async { self.status = "Camera permission denied — check Settings" }
         }
     }
-
-    // MARK: - Capture session
 
     private func setupCapture() {
         let session = AVCaptureSession()
@@ -93,20 +82,10 @@ class CameraStreamer: NSObject, ObservableObject {
 
         session.beginConfiguration()
 
-        // Pick the highest supported resolution
         let presets: [AVCaptureSession.Preset] = [.hd4K3840x2160, .hd1920x1080, .hd1280x720]
         let chosen = presets.first { session.canSetSessionPreset($0) } ?? .high
         session.sessionPreset = chosen
-
         session.addInput(input)
-
-        // Add Audio Input
-        if let audioDevice = AVCaptureDevice.default(for: .audio),
-           let audioInput = try? AVCaptureDeviceInput(device: audioDevice) {
-            if session.canAddInput(audioInput) {
-                session.addInput(audioInput)
-            }
-        }
 
         let output = AVCaptureVideoDataOutput()
         output.videoSettings = [
@@ -116,14 +95,6 @@ class CameraStreamer: NSObject, ObservableObject {
         output.alwaysDiscardsLateVideoFrames = true
         session.addOutput(output)
 
-        // Add Audio Output
-        let audioOutput = AVCaptureAudioDataOutput()
-        audioOutput.setSampleBufferDelegate(self, queue: streamQueue)
-        if session.canAddOutput(audioOutput) {
-            session.addOutput(audioOutput)
-        }
-
-        // Lock landscape orientation
         if let conn = output.connection(with: .video) {
             conn.videoOrientation = .landscapeRight
         }
@@ -137,7 +108,6 @@ class CameraStreamer: NSObject, ObservableObject {
         default:             resolutionLabel = "720p (1280×720)"
         }
 
-        // Setup VideoToolbox with chosen dimensions
         let w = chosen == .hd4K3840x2160 ? 3840 : (chosen == .hd1920x1080 ? 1920 : 1280)
         let h = chosen == .hd4K3840x2160 ? 2160 : (chosen == .hd1920x1080 ? 1080 : 720)
 
@@ -145,29 +115,25 @@ class CameraStreamer: NSObject, ObservableObject {
 
         captureSession = session
         session.startRunning()
+        startTCPServer()
 
-        // FPS counter timer
-        fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+        // Timer must be scheduled on main RunLoop
+        DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
-            DispatchQueue.main.async {
+            self.fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+                guard let self = self else { return }
                 self.fps = self.frameCount
                 self.frameCount = 0
             }
-        }
-
-        DispatchQueue.main.async {
             self.isCapturing = true
             self.resolution = resolutionLabel
             self.status = "Waiting for PC..."
         }
     }
 
-    // MARK: - VideoToolbox
-
     private func setupVideoToolbox(width: Int, height: Int) -> Bool {
         var session: VTCompressionSession?
-
-        let status = VTCompressionSessionCreate(
+        let err = VTCompressionSessionCreate(
             allocator: nil,
             width: Int32(width),
             height: Int32(height),
@@ -179,29 +145,19 @@ class CameraStreamer: NSObject, ObservableObject {
             refcon: nil,
             compressionSessionOut: &session
         )
-
-        guard status == noErr, let session = session else {
-            DispatchQueue.main.async { self.status = "VideoToolbox setup failed (\(status))" }
+        guard err == noErr, let session = session else {
+            DispatchQueue.main.async { self.status = "VideoToolbox setup failed (\(err))" }
             return false
         }
-
-        // Low-latency, real-time settings
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_RealTime, value: kCFBooleanTrue)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AllowFrameReordering, value: kCFBooleanFalse)
-
-        // High bitrate: 50 Mbps for 4K, 15 Mbps for 1080p
         let bitrate: Int = width >= 3840 ? 50_000_000 : 15_000_000
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: NSNumber(value: bitrate))
-
-        // Keyframe every 2 seconds
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: NSNumber(value: 60))
-
         VTCompressionSessionPrepareToEncodeFrames(session)
         compressionSession = session
         return true
     }
-
-    // MARK: - TCP server
 
     private func startTCPServer() {
         guard let listener = try? NWListener(using: .tcp, on: 4747) else { return }
@@ -209,42 +165,23 @@ class CameraStreamer: NSObject, ObservableObject {
 
         listener.newConnectionHandler = { [weak self] connection in
             guard let self = self else { return }
-            // Drop previous connection if any
             self.activeConnection?.cancel()
             self.activeConnection = connection
-            self.parameterSetsData = nil // force resend of SPS+PPS on reconnect
+            self.parameterSetsData = nil
 
             connection.stateUpdateHandler = { [weak self] state in
-                guard let self = self else { return }
                 switch state {
                 case .ready:
-                    DispatchQueue.main.async { self.isStreaming = true; self.status = "Streaming to PC" }
+                    DispatchQueue.main.async { self?.isStreaming = true; self?.status = "Streaming to PC" }
                 case .failed, .cancelled:
-                    DispatchQueue.main.async { self.isStreaming = false; self.status = "Waiting for PC..." }
+                    DispatchQueue.main.async { self?.isStreaming = false; self?.status = "Waiting for PC..." }
                 default: break
                 }
             }
             connection.start(queue: self.streamQueue)
         }
-
         listener.start(queue: streamQueue)
     }
-
-    private func startAudioTCPServer() {
-        guard let listener = try? NWListener(using: .tcp, on: 4748) else { return }
-        self.audioListener = listener
-
-        listener.newConnectionHandler = { [weak self] connection in
-            guard let self = self else { return }
-            self.activeAudioConnection?.cancel()
-            self.activeAudioConnection = connection
-            connection.start(queue: self.streamQueue)
-        }
-
-        listener.start(queue: streamQueue)
-    }
-
-    // MARK: - Frame sending
 
     private func sendData(_ data: Data) {
         guard let connection = activeConnection else { return }
@@ -258,7 +195,6 @@ class CameraStreamer: NSObject, ObservableObject {
             parameterSetPointerOut: nil, parameterSetSizeOut: nil,
             parameterSetCountOut: &count, nalUnitHeaderLengthOut: nil
         )
-
         var data = Data()
         for i in 0..<count {
             var ptr: UnsafePointer<UInt8>?
@@ -279,7 +215,6 @@ class CameraStreamer: NSObject, ObservableObject {
     private func handleEncodedFrame(_ sampleBuffer: CMSampleBuffer) {
         guard activeConnection != nil else { return }
 
-        // Detect IDR (keyframe)
         let isKeyFrame: Bool = {
             if let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
                let first = attachments.first {
@@ -289,15 +224,10 @@ class CameraStreamer: NSObject, ObservableObject {
         }()
 
         var annexB = Data()
-
-        // Prepend SPS+PPS on keyframes (cache them to avoid duplicate extractions)
         if isKeyFrame, let fmt = CMSampleBufferGetFormatDescription(sampleBuffer) {
-            let ps = parameterSets(from: fmt)
-            parameterSetsData = ps
-            annexB += ps
+            annexB += parameterSets(from: fmt)
         }
 
-        // Convert AVCC → Annex-B
         guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
         let totalLen = CMBlockBufferGetDataLength(block)
         var raw = [UInt8](repeating: 0, count: totalLen)
@@ -317,25 +247,10 @@ class CameraStreamer: NSObject, ObservableObject {
         frameCount += 1
     }
 
-    private func handleAudioFrame(_ sampleBuffer: CMSampleBuffer) {
-        guard activeAudioConnection != nil else { return }
-        
-        guard let blockBuffer = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-        let length = CMBlockBufferGetDataLength(blockBuffer)
-        var pcmData = [UInt8](repeating: 0, count: length)
-        CMBlockBufferCopyDataBytes(blockBuffer, atOffset: 0, dataLength: length, destination: &pcmData)
-        
-        let data = Data(pcmData)
-        activeAudioConnection?.send(content: data, completion: .idempotent)
-    }
-
-    // MARK: - Helpers
-
     private func getLocalIP() -> String {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0 else { return "Unknown" }
         defer { freeifaddrs(ifaddr) }
-
         var ptr = ifaddr
         while let current = ptr {
             let iface = current.pointee
@@ -354,28 +269,21 @@ class CameraStreamer: NSObject, ObservableObject {
     }
 }
 
-// MARK: - AVCaptureVideo/AudioDataOutputSampleBufferDelegate
-
-extension CameraStreamer: AVCaptureVideoDataOutputSampleBufferDelegate, AVCaptureAudioDataOutputSampleBufferDelegate {
+extension CameraStreamer: AVCaptureVideoDataOutputSampleBufferDelegate {
     func captureOutput(_ output: AVCaptureOutput, didOutput sampleBuffer: CMSampleBuffer, from connection: AVCaptureConnection) {
-        if output is AVCaptureVideoDataOutput {
-            guard let cs = compressionSession,
-                  let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
-
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            VTCompressionSessionEncodeFrame(
-                cs,
-                imageBuffer: imageBuffer,
-                presentationTimeStamp: pts,
-                duration: .invalid,
-                frameProperties: nil,
-                infoFlagsOut: nil
-            ) { [weak self] status, _, encoded in
-                guard status == noErr, let encoded = encoded else { return }
-                self?.handleEncodedFrame(encoded)
-            }
-        } else if output is AVCaptureAudioDataOutput {
-            handleAudioFrame(sampleBuffer)
+        guard let cs = compressionSession,
+              let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        VTCompressionSessionEncodeFrame(
+            cs,
+            imageBuffer: imageBuffer,
+            presentationTimeStamp: pts,
+            duration: .invalid,
+            frameProperties: nil,
+            infoFlagsOut: nil
+        ) { [weak self] status, _, encoded in
+            guard status == noErr, let encoded = encoded else { return }
+            self?.handleEncodedFrame(encoded)
         }
     }
 }
