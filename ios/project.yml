@@ -8,7 +8,7 @@ targets:
   iPhoneCam:
     type: application
     platform: iOS
-    bundleId: com.local.iphonecam
+    bundleId: com.eitanbuky.iphonecam
     sources:
       - path: Sources/iPhoneCam
         excludes:
