@@ -236,6 +236,10 @@ class CameraStreamer: NSObject, ObservableObject {
                 }
             }
             guard fd >= 0, serverRunning else { break }
+            
+            var one: Int32 = 1
+            setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
+            
             closeClient()
             clientFD = fd
             DispatchQueue.main.async { self.isStreaming = true; self.status = "Streaming to PC" }

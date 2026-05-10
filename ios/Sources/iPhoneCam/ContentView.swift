@@ -24,7 +24,7 @@ struct ContentView: View {
                 // Status card
                 VStack(spacing: 12) {
                     StatusRow(label: "IP Address", value: streamer.localIP.isEmpty ? "Detecting..." : streamer.localIP, valueColor: .cyan)
-                    StatusRow(label: "Port", value: "4747", valueColor: .white)
+                    StatusRow(label: "Ports", value: "4747 (Vid), 4748 (Aud)", valueColor: .white)
                     StatusRow(label: "Resolution", value: streamer.resolution, valueColor: .white)
                     StatusRow(label: "Status", value: streamer.status, valueColor: streamer.isStreaming ? .green : .yellow)
                     if streamer.isStreaming {

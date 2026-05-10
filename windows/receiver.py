@@ -97,6 +97,50 @@ def detect_stream_info(ip: str, port: int, timeout: int = 60) -> tuple[int, int,
 
 # ── Main receive loop ─────────────────────────────────────────────────────────
 
+def record_stream(ip: str):
+    w, h, fps = detect_stream_info(ip, PORT)
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    outfile = f"Recording_{timestamp}.mp4"
+    
+    print(f"\n[Record] Starting recording to {outfile}...")
+    print(f"[Record] Video: {w}x{h} @ {fps:.1f}fps")
+    print(f"[Record] Audio: PCM 44.1kHz from port 4748")
+    
+    if not FFMPEG:
+        print("[ERROR] ffmpeg not found.")
+        sys.exit(1)
+        
+    ffmpeg_cmd = [
+        FFMPEG,
+        "-y",
+        "-loglevel", "error",
+        "-f", "h264",
+        "-i", f"tcp://{ip}:{PORT}",
+        "-f", "s16le",
+        "-ar", "44100",
+        "-ac", "1",
+        "-i", f"tcp://{ip}:4748",
+        "-c:v", "copy",
+        "-c:a", "aac",
+        outfile
+    ]
+    
+    proc = subprocess.Popen(ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    
+    def log_errors():
+        for line in proc.stderr:
+            print(f"[ffmpeg] {line.decode().strip()}")
+    threading.Thread(target=log_errors, daemon=True).start()
+    
+    try:
+        print("[Record] Recording... Press Ctrl+C to stop.")
+        proc.wait()
+    except KeyboardInterrupt:
+        print("\n[Record] Stopping recording...")
+        proc.terminate()
+        proc.wait()
+        print(f"[Record] Saved to {outfile}")
+
 def receive(ip: str):
     w, h, fps = detect_stream_info(ip, PORT)
     fps_int = max(1, round(fps))
@@ -171,8 +215,22 @@ if __name__ == "__main__":
         print("No IP provided.")
         sys.exit(1)
 
+    mode = "stream"
+    if len(sys.argv) >= 3:
+        mode = "record" if sys.argv[2].lower() in ["record", "2"] else "stream"
+    else:
+        print("\nSelect mode:")
+        print("1) Stream to Virtual Camera (Video only)")
+        print("2) Record directly to MP4 (Video + Audio)")
+        choice = input("Enter 1 or 2 [default 1]: ").strip()
+        mode = "record" if choice == "2" else "stream"
+
     print(f"\n iPhone Cam Receiver")
     print(f" Target: {ip}:{PORT}")
+    print(f" Mode: {mode}")
     print(f" Make sure the iPhone app is open and on the same WiFi\n")
 
-    receive(ip)
+    if mode == "record":
+        record_stream(ip)
+    else:
+        receive(ip)
